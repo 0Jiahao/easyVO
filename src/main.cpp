@@ -5,9 +5,14 @@
 #include <string>
 #include <bits/stdc++.h> 
 #include <opencv2/core/core.hpp>
+#include <opencv2/core/mat.hpp>
+#include <opencv2/core/operations.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/xfeatures2d.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/calib3d/calib3d.hpp>
+#include <opencv2/video/tracking.hpp>
+#include <opencv2/imgproc/types_c.h>
 
 using namespace std;
 using namespace cv;
@@ -27,11 +32,17 @@ class VO_estimator
     Mat projMat_r;                              // ...            of right camera
     Mat F;                                      // fundamental matrix between left and right camera
     Mat img_l;                                  // left image
+    Mat img_l_prev;                             // left image (previous)
     Mat img_r;                                  // right image
+    Mat rvec_pnp;                               // extracted rotational vector
+    Mat tvec_pnp;                               // extracted traslation vector
     int n_landmarks_l;                          // number of landmarks desired(lower bound)
     int n_landmarks_u;                          // number of landmarks (upper bound)
-    vector<Point3f> landmarks;                  // 3d points for tracking 
-    vector<pair<Point2f,Point2f>> new_matches;  // new added matches
+    vector<Point3d> landmarks;                              // 3d points for tracking 
+    vector<Point2f> landmarks_on_img_l;         // 2d points for tracking (on left image)
+    vector<Point2d> new_matches_on_img_l;       // new added matches on left image
+    vector<Point2d> new_matches_on_img_r;       // ...               on right image
+
     // constructor
     VO_estimator();
     // read stereo camera parameters
@@ -46,7 +57,7 @@ VO_estimator::VO_estimator()
 {
     this->isempty = true;
     this->n_landmarks_l = 200;
-    this->n_landmarks_u = 300;
+    this->n_landmarks_u = 350;
 }
 
 void VO_estimator::read_stereo_camera_param(Mat rot_l, Mat K_l, Mat dist_l, Mat rot_r, Mat K_r, Mat dist_r)
@@ -72,6 +83,7 @@ void VO_estimator::read_stereo_camera_param(Mat rot_l, Mat K_l, Mat dist_l, Mat 
 
 void VO_estimator::read_new_frame(Mat img0, Mat img1)
 {
+    this->img_l_prev = this->img_l;
     this->img_l = img0;
     this->img_r = img1;
     this->isempty = ((this->img_l.empty()) || (this->img_r.empty()));
@@ -80,13 +92,49 @@ void VO_estimator::read_new_frame(Mat img0, Mat img1)
 void VO_estimator::process()
 {
     cout << "--------------------" << endl;
-    // the case new landmarks need to be added
-    if (this->landmarks.size() < this->n_landmarks_l)
+    this->new_matches_on_img_l.clear();
+    this->new_matches_on_img_r.clear();
+    // track the previous feature (standard only)
+    if((this->landmarks.size() > 0) && ~(this->img_l_prev.empty()))
     {
-        cout << "Adding new features..." << endl;
+        cout << "standard" << endl;
+        vector<uchar> status;
+	    vector<float> err;
+        vector<Point2f> tracked;
+        calcOpticalFlowPyrLK(this->img_l_prev, this->img_l, this->landmarks_on_img_l, tracked, status, err, Size(11, 11), 3, TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 30, 0.01));
+        // only restore the well-tracked points
+        for(int p = status.size()-1; p > -1; p--)
+        {
+            if((int)(status[p]) != 1)
+            {
+                tracked.erase(tracked.begin() + p);
+                this->landmarks.erase(this->landmarks.begin() + p);
+            }
+        }
+        this->landmarks_on_img_l = tracked;
+        cout << "[DEBUG]\t" << "Successfully track: " << this->landmarks.size() << endl;
+        // RANSAC filter out outliners
+        vector<int> inliers;
+        solvePnPRansac(this->landmarks, this->landmarks_on_img_l, this->K_l, this->dist_l, this->rvec_pnp, this->tvec_pnp, true, 100, 100.0, 0.99, inliers, CV_P3P);
+        vector<Point3d> landmarks_inliers;
+        vector<Point2f> landmarks_on_img_l_inliers;
+        for(int i = 0; i < inliers.size(); i++)
+        {
+            landmarks_inliers.push_back(this->landmarks[inliers[i]]);
+            landmarks_on_img_l_inliers.push_back(this->landmarks_on_img_l[inliers[i]]);
+        }
+        this->landmarks = landmarks_inliers;
+        this->landmarks_on_img_l = landmarks_on_img_l_inliers;
+    }
+    // the case new landmarks need to be added 
+    if(this->landmarks.size() < this->n_landmarks_l)
+    {
+        cout << "keyframe" << endl;
         // extract feature points
         vector<KeyPoint> pts_l, pts_r; // grid adapted detector is more preferable
-        Ptr<ORB> orb = ORB::create(300, 1, 1, 31, 0, 2, ORB::FAST_SCORE, 31);
+        // number of feature going to extract
+        int n_feature_need = 1.3 * (this->n_landmarks_u - this->landmarks.size());
+        Ptr<ORB> orb = ORB::create(n_feature_need, 1, 1, 31, 0, 2, ORB::FAST_SCORE, 31, 10);
         orb->detect(this->img_l, pts_l);
         orb->detect(this->img_r, pts_r);
         // compute descriptors
@@ -120,11 +168,24 @@ void VO_estimator::process()
             generate(begin(idx), end(idx), [&]{return n++;});
             // sort the score and return corresponding index
             sort(begin(idx), end(idx), [&](int x, int y){return scores[x] < scores[y];});
-            this->new_matches.clear();
             for(int m = 0; m < ((n_good_matches > this->n_landmarks_u - landmarks.size())?this->n_landmarks_u - landmarks.size():n_good_matches) ; m++)
             {
-                this->new_matches.push_back(make_pair(pts_l[matches[idx[m]].queryIdx].pt, pts_r[matches[idx[m]].trainIdx].pt));
+                this->new_matches_on_img_l.push_back(pts_l[matches[idx[m]].queryIdx].pt);
+                this->new_matches_on_img_r.push_back(pts_r[matches[idx[m]].trainIdx].pt);
             }
+            Mat new_landmarks;
+            triangulatePoints(this->projMat_l, this->projMat_r, new_matches_on_img_l, new_matches_on_img_r, new_landmarks);
+            // rescale the 3d point
+            for(int p = 0; p < new_landmarks.cols; p++)
+            {
+                new_landmarks.at<double>(0, p) = new_landmarks.at<double>(0, p) / new_landmarks.at<double>(3, p);
+                new_landmarks.at<double>(1, p) = new_landmarks.at<double>(1, p) / new_landmarks.at<double>(3, p);
+                new_landmarks.at<double>(2, p) = new_landmarks.at<double>(2, p) / new_landmarks.at<double>(3, p);
+                // add result (3d) to the estimator
+                this->landmarks.push_back(Point3d(new_landmarks.at<double>(0, p), new_landmarks.at<double>(1, p), new_landmarks.at<double>(2, p)));
+            }
+            // add result (2d) to the estimator
+            this->landmarks_on_img_l.insert(this->landmarks_on_img_l.end(), new_matches_on_img_l.begin(), new_matches_on_img_l.end());
         }
     }
     else
@@ -163,12 +224,16 @@ void visualization(VO_estimator estimator)
         Mat show;
         hconcat(estimator.img_l, estimator.img_r, show);
         cvtColor(show, show, CV_GRAY2RGB);
-        Point2f bais(estimator.img_l.cols, 0);
-        for(int m = 0; m < estimator.new_matches.size(); m++)
+        Point2d bais(estimator.img_l.cols, 0);
+        for(int f = 0; f < estimator.landmarks_on_img_l.size(); f++)
         {
-            line(show, estimator.new_matches[m].first, estimator.new_matches[m].second + bais, Scalar(0, 255, 0), 1);
-            circle(show, estimator.new_matches[m].first, 1, Scalar(0, 0, 255), 3);
-            circle(show, estimator.new_matches[m].second + bais, 1, Scalar(0, 0, 255), 3);
+            circle(show, estimator.landmarks_on_img_l[f], 1, Scalar(0, 255, 0), 3);
+        }
+        for(int m = 0; m < estimator.new_matches_on_img_l.size(); m++)
+        {
+            line(show, estimator.new_matches_on_img_l[m], estimator.new_matches_on_img_r[m] + bais, Scalar(0, 0, 255), 1);
+            circle(show, estimator.new_matches_on_img_l[m], 1, Scalar(0, 0, 255), 3);
+            circle(show, estimator.new_matches_on_img_r[m] + bais, 1, Scalar(0, 0, 255), 3);
         }
         imshow("Image",show);
         waitKey(50);
@@ -213,7 +278,6 @@ int main() {
         clock_t clockTicksTaken = endTime - startTime;
         double timeInSeconds = clockTicksTaken / (double) CLOCKS_PER_SEC;
         cout << "time: " << timeInSeconds << endl;
-        cout << "[DEBUG]\t" << my_estimator.new_matches.size() << endl;
         // visualization
         visualization(my_estimator);
     }
