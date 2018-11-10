@@ -184,13 +184,13 @@ int main() {
     // estimator initialization
     VO_estimator my_estimator;
     // read camera parameters
-    FileStorage fs_l("../mav0/cam0/camera.yml", FileStorage::READ);
+    FileStorage fs_l("../sensors/camera_left.yml", FileStorage::READ);
 	Mat rot_l, K_l, dist_l;
 	fs_l["T_BS"] >> rot_l;
     fs_l["cameraMatrix"] >> K_l;
     fs_l["distCoeffs"] >> dist_l;
     fs_l.release();
-    FileStorage fs_r("../mav0/cam1/camera.yml", FileStorage::READ);
+    FileStorage fs_r("../sensors/camera_right.yml", FileStorage::READ);
 	Mat rot_r, K_r, dist_r;
 	fs_r["T_BS"] >> rot_r;
     fs_r["cameraMatrix"] >> K_r;
