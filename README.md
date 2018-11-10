@@ -1,2 +1,2 @@
 # easyVO
-An simple visual odometry approach
+A simple visual odometry approach
