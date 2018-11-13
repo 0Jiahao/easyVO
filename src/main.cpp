@@ -1,5 +1,3 @@
-// TODO:    1. change feature extraction (grid)
-//          2. try FREAK descriptor
 #include <iostream>
 #include <dirent.h>
 #include <sys/types.h>
@@ -15,6 +13,7 @@
 #include <opencv2/calib3d/calib3d.hpp>
 #include <opencv2/video/tracking.hpp>
 #include <opencv2/imgproc/types_c.h>
+#include <opencv2/xfeatures2d.hpp>
 
 using namespace std;
 using namespace cv;
@@ -107,7 +106,6 @@ void VO_estimator::read_new_frame(Mat img0, Mat img1)
 
 void VO_estimator::track_landmarks()
 {
-    cout << this->landmarks_on_img_l.size() << endl;
     vector<uchar> status;
     vector<float> err;
     vector<Point2f> tracked;
@@ -122,7 +120,6 @@ void VO_estimator::track_landmarks()
         }
     }
     this->landmarks_on_img_l = tracked;
-    cout << "[DEBUG]\t" << "Successfully track: " << this->landmarks.size() << endl;
     // estimate rotation and translation
     vector<int> inliers;
     Mat rvec_pnp, tvec_pnp, rmat_pnp;
@@ -141,15 +138,14 @@ void VO_estimator::track_landmarks()
     }
     this->landmarks = landmarks_inliers;
     this->landmarks_on_img_l = landmarks_on_img_l_inliers;
-    cout << "tracked landmarks: " << landmarks_on_img_l.size() << endl;
 }
 
 void VO_estimator::extract_correspondences(int d)
 {
     // extract feature points
     vector<KeyPoint> kps_l, kps_r; // grid adapted detector is more preferable
-    FAST(this->img_l, kps_l, 30, true, FastFeatureDetector::TYPE_9_16);
-    FAST(this->img_r, kps_r, 30, true, FastFeatureDetector::TYPE_9_16);
+    FAST(this->img_l, kps_l, 50, true, FastFeatureDetector::TYPE_9_16);
+    FAST(this->img_r, kps_r, 50, true, FastFeatureDetector::TYPE_9_16);
     // sort kps_l by response
     sort(kps_l.begin(), kps_l.end(), [](KeyPoint& a, KeyPoint& b){return a.response > b.response;});
     // filter out features base on distance
@@ -184,9 +180,10 @@ void VO_estimator::extract_correspondences(int d)
     }
     // compute descriptors
     Mat des_l, des_r;
+    Ptr<DescriptorExtractor> freak = xfeatures2d::FREAK::create();
     Ptr<DescriptorExtractor> orb = ORB::create();
-    orb->compute(this->img_l, kps_l, des_l);
-    orb->compute(this->img_r, kps_r, des_r);
+    freak->compute(this->img_l, kps_l, des_l);
+    freak->compute(this->img_r, kps_r, des_r);
     // match them
     vector<DMatch> matches; 
     BFMatcher bfMatcher(NORM_HAMMING);
@@ -262,7 +259,6 @@ void VO_estimator::process()
     // if(this->landmarks.size() == 0)
     if(this->landmarks.size() < this->n_landmarks_l)
     {
-        cout << "keyframe" << endl;
         extract_correspondences(15);
         if(this->new_matches_on_img_l.size() > 0)
         {
@@ -298,6 +294,7 @@ void visualization(VO_estimator estimator)
 {
     if(~estimator.isempty)
     {
+        float factor = 15;
         Mat show;
         hconcat(estimator.img_l, estimator.img_r, show);
         cvtColor(show, show, CV_GRAY2RGB);
@@ -319,12 +316,23 @@ void visualization(VO_estimator estimator)
         Point2d l_;
         for(int l = 0; l < estimator.landmarks.size(); l++)
         {
-            l_.x = estimator.landmarks[l].x * 15 + map_2d.rows / 2;
-            l_.y = -estimator.landmarks[l].z * 15 + map_2d.cols / 2;
+            l_.x = estimator.landmarks[l].x * factor + map_2d.cols / 2;
+            l_.y = -estimator.landmarks[l].z * factor + map_2d.rows / 2;
             circle(map_2d, l_, 1, Scalar(0, 255, 0), 1.3);
         }
-        // draw boay
-        circle(map_2d, Point2d(estimator.tvec_w.at<double>(0,0) * 15 + map_2d.rows / 2, -estimator.tvec_w.at<double>(2,0) * 15 + map_2d.cols / 2), 1, Scalar(0, 0, 255), 3);
+        // body point
+        Point2d body(estimator.tvec_w.at<double>(0,0) * factor + map_2d.cols / 2, -estimator.tvec_w.at<double>(2,0) * factor + map_2d.rows / 2);
+        // draw direction
+        Mat axis = (Mat_<double>(3, 1) << 0, 0, 25);
+        axis = estimator.rmat_w * axis;
+        Point2d arrow(axis.at<double>(0, 0), -axis.at<double>(2, 0));
+        line(map_2d, body, body + arrow, Scalar(0, 0, 255), 2);
+        // draw body
+        circle(map_2d, body, 1, Scalar(0, 0, 255), 5);
+        // write informations
+        putText(map_2d, "z: " + to_string(estimator.tvec_w.at<double>(2, 0)), Point2f(5, map_2d.rows - 5), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1, 1, false);
+        putText(map_2d, "y: " + to_string(estimator.tvec_w.at<double>(1, 0)), Point2f(5, map_2d.rows - 25), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1, 1, false);
+        putText(map_2d, "x: " + to_string(estimator.tvec_w.at<double>(0, 0)), Point2f(5, map_2d.rows - 45), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1, 1, false);
         // show
         imshow("Image",show);
         imshow("Map", map_2d);
@@ -370,7 +378,6 @@ int main() {
         clock_t clockTicksTaken = endTime - startTime;
         double timeInSeconds = clockTicksTaken / (double) CLOCKS_PER_SEC;
         cout << "time: " << timeInSeconds << endl;
-        cout << "position: \n" << my_estimator.tvec_w << endl;
         // visualization
         visualization(my_estimator);
     }
