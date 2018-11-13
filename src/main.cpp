@@ -182,8 +182,8 @@ void VO_estimator::extract_correspondences(int d)
     Mat des_l, des_r;
     Ptr<DescriptorExtractor> freak = xfeatures2d::FREAK::create();
     Ptr<DescriptorExtractor> orb = ORB::create();
-    freak->compute(this->img_l, kps_l, des_l);
-    freak->compute(this->img_r, kps_r, des_r);
+    orb->compute(this->img_l, kps_l, des_l);
+    orb->compute(this->img_r, kps_r, des_r);
     // match them
     vector<DMatch> matches; 
     BFMatcher bfMatcher(NORM_HAMMING);
@@ -256,10 +256,9 @@ void VO_estimator::process()
         track_landmarks();
     }
     // the case new landmarks need to be added 
-    // if(this->landmarks.size() == 0)
     if(this->landmarks.size() < this->n_landmarks_l)
     {
-        extract_correspondences(15);
+        extract_correspondences(30);
         if(this->new_matches_on_img_l.size() > 0)
         {
             triangulate_correspondences();
@@ -290,15 +289,14 @@ vector<unsigned long long> extract_timestamps(const char *path)
    return timestamps;
 }
 
-void visualization(VO_estimator estimator)
+void visualization(VO_estimator estimator, float timeInSeconds)
 {
+    static vector<Point2d> trajectory;
     if(~estimator.isempty)
     {
         float factor = 15;
         Mat show;
-        hconcat(estimator.img_l, estimator.img_r, show);
-        cvtColor(show, show, CV_GRAY2RGB);
-        Point2d bais(estimator.img_l.cols, 0);
+        cvtColor(estimator.img_l, show, CV_GRAY2RGB);
         // draw new matches
         for(int f = 0; f < estimator.landmarks_on_img_l.size(); f++)
         {
@@ -306,12 +304,22 @@ void visualization(VO_estimator estimator)
         }
         for(int m = 0; m < estimator.new_matches_on_img_l.size(); m++)
         {
-            line(show, estimator.new_matches_on_img_l[m], estimator.new_matches_on_img_r[m] + bais, Scalar(0, 0, 255), 1);
             circle(show, estimator.new_matches_on_img_l[m], 1, Scalar(0, 0, 255), 3);
-            circle(show, estimator.new_matches_on_img_r[m] + bais, 1, Scalar(0, 0, 255), 3);
         }
         // draw map
-        Mat map_2d = Mat::ones(500,500,CV_8UC3);
+        Mat map_2d = Mat::ones(480,480,CV_8UC3);
+        // body point
+        Point2d body(estimator.tvec_w.at<double>(0,0) * factor + map_2d.cols / 2, -estimator.tvec_w.at<double>(2,0) * factor + map_2d.rows / 2);
+        // update trajectory
+        trajectory.push_back(body);
+        // draw trajectory
+        if(trajectory.size() > 2)
+        {
+            for(int t = 1; t < trajectory.size(); t++)
+            {
+                line(map_2d, trajectory[t-1], trajectory[t], Scalar(175, 175, 175), 2);
+            }
+        }
         // draw landmarks
         Point2d l_;
         for(int l = 0; l < estimator.landmarks.size(); l++)
@@ -320,8 +328,6 @@ void visualization(VO_estimator estimator)
             l_.y = -estimator.landmarks[l].z * factor + map_2d.rows / 2;
             circle(map_2d, l_, 1, Scalar(0, 255, 0), 1.3);
         }
-        // body point
-        Point2d body(estimator.tvec_w.at<double>(0,0) * factor + map_2d.cols / 2, -estimator.tvec_w.at<double>(2,0) * factor + map_2d.rows / 2);
         // draw direction
         Mat axis = (Mat_<double>(3, 1) << 0, 0, 25);
         axis = estimator.rmat_w * axis;
@@ -330,13 +336,23 @@ void visualization(VO_estimator estimator)
         // draw body
         circle(map_2d, body, 1, Scalar(0, 0, 255), 5);
         // write informations
-        putText(map_2d, "z: " + to_string(estimator.tvec_w.at<double>(2, 0)), Point2f(5, map_2d.rows - 5), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1, 1, false);
-        putText(map_2d, "y: " + to_string(estimator.tvec_w.at<double>(1, 0)), Point2f(5, map_2d.rows - 25), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1, 1, false);
-        putText(map_2d, "x: " + to_string(estimator.tvec_w.at<double>(0, 0)), Point2f(5, map_2d.rows - 45), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1, 1, false);
+        string text;
+        text = to_string(timeInSeconds);
+        text = text.substr(0,5);
+        putText(map_2d, "t: " + text, Point2f(5, map_2d.rows - 5), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1, 1, false);
+        text = to_string(estimator.tvec_w.at<double>(2, 0));
+        text = text.substr(0,5);
+        putText(map_2d, "z: " + text, Point2f(5, map_2d.rows - 25), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1, 1, false);
+        text = to_string(estimator.tvec_w.at<double>(1, 0));
+        text = text.substr(0,5);
+        putText(map_2d, "y: " + text, Point2f(5, map_2d.rows - 45), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1, 1, false);
+        text = to_string(estimator.tvec_w.at<double>(0, 0));
+        text = text.substr(0,5);
+        putText(map_2d, "x: " + text, Point2f(5, map_2d.rows - 65), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1, 1, false);
+        hconcat(show, map_2d, show);
         // show
-        imshow("Image",show);
-        imshow("Map", map_2d);
-        waitKey(50);
+        imshow("Visualization",show);
+        waitKey(1);
     }
 }
 
@@ -379,6 +395,6 @@ int main() {
         double timeInSeconds = clockTicksTaken / (double) CLOCKS_PER_SEC;
         cout << "time: " << timeInSeconds << endl;
         // visualization
-        visualization(my_estimator);
+        visualization(my_estimator, timeInSeconds);
     }
 }
