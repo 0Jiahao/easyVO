@@ -1,5 +1,5 @@
 # easyVO
-A simple real-time visual odometry approach
+A simple real-time visual odometry approach for stereo camera.
 ### Method
 This project is mainly built based on [eVO](http://w3.onera.fr/copernic/sites/w3.onera.fr.copernic/files/documents/conference_papers/2013_-_iros_-_evo_a_realtime_embedded_stereo_odometry_for_mav_applications.pdf).
 ### Data Set
