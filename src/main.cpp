@@ -1,3 +1,5 @@
+// TODO:    1. change feature extraction (grid)
+//          2. try FREAK descriptor
 #include <iostream>
 #include <dirent.h>
 #include <sys/types.h>
@@ -22,8 +24,6 @@ class VO_estimator
     public:
     // members
     bool isempty;                               // flag of start
-    Mat rot_l;                                  // transform matrix of left camera
-    Mat rot_r;                                  // ...              of right camera
     Mat K_l;                                    // camera matrix of left camera
     Mat K_r;                                    // ...           of right camera
     Mat dist_l;                                 // distortion coefficients of left camera 
@@ -34,12 +34,14 @@ class VO_estimator
     Mat img_l;                                  // left image
     Mat img_l_prev;                             // left image (previous)
     Mat img_r;                                  // right image
-    Mat rvec_pnp;                               // extracted rotational vector
-    Mat tvec_pnp;                               // extracted traslation vector
+    Mat rmat_w;                                 // rotation world frame
+    Mat tvec_w;                                 // translation world frame
     int n_landmarks_l;                          // number of landmarks desired(lower bound)
     int n_landmarks_u;                          // number of landmarks (upper bound)
-    vector<Point3d> landmarks;                              // 3d points for tracking 
+    vector<Point3d> landmarks;                  // 3d points for tracking 
     vector<Point2f> landmarks_on_img_l;         // 2d points for tracking (on left image)
+    int vstep;                                  // vertical step (image segamentation)
+    int hstep;                                  // horizontal step
     vector<Point2d> new_matches_on_img_l;       // new added matches on left image
     vector<Point2d> new_matches_on_img_r;       // ...               on right image
 
@@ -49,6 +51,14 @@ class VO_estimator
     void read_stereo_camera_param(Mat rot_l, Mat K_l, Mat dist_l, Mat rot_r, Mat K_r, Mat dist_r);
     // read new frame
     void read_new_frame(Mat img0, Mat img1);
+    // track the existed landmarks
+    void track_landmarks();
+    // extract correspondences
+    void extract_correspondences(int d); // d-> minimal distance between features
+    // triangulate new landmarks
+    void triangulate_correspondences();
+    // update the projection matrix
+    void update_projMat();
     // estimator process
     void process();
 };
@@ -56,24 +66,30 @@ class VO_estimator
 VO_estimator::VO_estimator()
 {
     this->isempty = true;
-    this->n_landmarks_l = 200;
-    this->n_landmarks_u = 350;
+    this->n_landmarks_l = 150;
+    this->n_landmarks_u = 225;
+    this->rmat_w = Mat::eye(3, 3, CV_64F);
+    this->tvec_w = (Mat_<double>(3, 1) << 0,0,0);
+    this->vstep = 6;
+    this->hstep = 8;
 }
 
 void VO_estimator::read_stereo_camera_param(Mat rot_l, Mat K_l, Mat dist_l, Mat rot_r, Mat K_r, Mat dist_r)
 {
-    this->rot_l = rot_l;
-    this->rot_r = rot_r;
     this->K_l = K_l;
     this->K_r = K_r;
     this->dist_l = dist_l;
     this->dist_r = dist_r;
     // compute projection matries
     Mat identity34 = (Mat_<double>(3, 4) << 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0);
-    this->projMat_l = this->K_l * identity34 * rot_l;
-    this->projMat_r = this->K_r * identity34 * rot_r;
+    Mat scale = (Mat_<double>(1, 4) << 0, 0, 0, 1);
     // compute fundamental matrix from left to right camera
-    Mat Tlr = rot_l(Rect(0, 0, 3, 3)).t() * (rot_r(Rect(3, 0, 1, 3)) - rot_l(Rect(3, 0, 1, 3)));
+    Mat Tlr = rot_l(Rect(0, 0, 3, 3)) * (rot_r(Rect(3, 0, 1, 3)) - rot_l(Rect(3, 0, 1, 3)));
+    Mat transform_mat;
+    hconcat(rot_r(Rect(0, 0, 3, 3)) * rot_l(Rect(0, 0, 3, 3)).t(), Tlr, transform_mat);
+    vconcat(transform_mat, scale, transform_mat);
+    this->projMat_l = K_l * identity34;
+    this->projMat_r = K_r * identity34 * transform_mat;
     double tx = Tlr.at<double>(0,0);
     double ty = Tlr.at<double>(0,1);
     double tz = Tlr.at<double>(0,2);
@@ -89,6 +105,149 @@ void VO_estimator::read_new_frame(Mat img0, Mat img1)
     this->isempty = ((this->img_l.empty()) || (this->img_r.empty()));
 }
 
+void VO_estimator::track_landmarks()
+{
+    cout << this->landmarks_on_img_l.size() << endl;
+    vector<uchar> status;
+    vector<float> err;
+    vector<Point2f> tracked;
+    calcOpticalFlowPyrLK(this->img_l_prev, this->img_l, this->landmarks_on_img_l, tracked, status, err, Size(11, 11), 6, TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 30, 0.01));
+    // remove untracked landmarks
+    for(int p = status.size()-1; p > -1; p--)
+    {
+        if((int)(status[p]) != 1)
+        {
+            tracked.erase(tracked.begin() + p);
+            this->landmarks.erase(this->landmarks.begin() + p);
+        }
+    }
+    this->landmarks_on_img_l = tracked;
+    cout << "[DEBUG]\t" << "Successfully track: " << this->landmarks.size() << endl;
+    // estimate rotation and translation
+    vector<int> inliers;
+    Mat rvec_pnp, tvec_pnp, rmat_pnp;
+    solvePnPRansac(this->landmarks, this->landmarks_on_img_l, this->K_l, this->dist_l, rvec_pnp, tvec_pnp, true, 100, 15.0, 0.99, inliers, CV_P3P);
+    Rodrigues(rvec_pnp, rmat_pnp);
+    // inverse the rotation and translation
+    this->rmat_w = rmat_pnp.inv();
+    this->tvec_w = -rmat_pnp.inv() * tvec_pnp;
+    // RANSAC filter out outliners
+    vector<Point3d> landmarks_inliers;
+    vector<Point2f> landmarks_on_img_l_inliers;
+    for(int i = 0; i < inliers.size(); i++)
+    {
+        landmarks_inliers.push_back(this->landmarks[inliers[i]]);
+        landmarks_on_img_l_inliers.push_back(this->landmarks_on_img_l[inliers[i]]);
+    }
+    this->landmarks = landmarks_inliers;
+    this->landmarks_on_img_l = landmarks_on_img_l_inliers;
+    cout << "tracked landmarks: " << landmarks_on_img_l.size() << endl;
+}
+
+void VO_estimator::extract_correspondences(int d)
+{
+    // extract feature points
+    vector<KeyPoint> kps_l, kps_r; // grid adapted detector is more preferable
+    FAST(this->img_l, kps_l, 30, true, FastFeatureDetector::TYPE_9_16);
+    FAST(this->img_r, kps_r, 30, true, FastFeatureDetector::TYPE_9_16);
+    // sort kps_l by response
+    sort(kps_l.begin(), kps_l.end(), [](KeyPoint& a, KeyPoint& b){return a.response > b.response;});
+    // filter out features base on distance
+    bool too_close;
+    for(int i = 0; i < kps_l.size(); i++)
+    {
+        too_close = false;
+        // compare with tracked landmarks
+        for(int l = 0; l < this->landmarks_on_img_l.size(); l++)
+        {
+            if(norm(this->landmarks_on_img_l[l] - kps_l[i].pt) < d)
+            {
+                too_close = true;
+                kps_l.erase(kps_l.begin() + i);
+                i--;
+                break;
+            }
+        }
+        if((too_close == false))
+        {
+            // compare with stronger new features
+            for(int j = 0; j < i; j++)
+            {
+                if(norm(kps_l[i].pt - kps_l[j].pt) < d)
+                {
+                    kps_l.erase(kps_l.begin() + i);
+                    i--;
+                    break;
+                }
+            }
+        }
+    }
+    // compute descriptors
+    Mat des_l, des_r;
+    Ptr<DescriptorExtractor> orb = ORB::create();
+    orb->compute(this->img_l, kps_l, des_l);
+    orb->compute(this->img_r, kps_r, des_r);
+    // match them
+    vector<DMatch> matches; 
+    BFMatcher bfMatcher(NORM_HAMMING);
+    if(kps_l.size() > 0 && kps_r.size() > 0)
+    {
+        bfMatcher.match(des_l, des_r, matches);
+        vector<Point2d> pts_l, pts_r;
+        for(int m = 0; m < matches.size(); m++)
+        {
+            this->new_matches_on_img_l.push_back(kps_l[matches[m].queryIdx].pt);
+            this->new_matches_on_img_r.push_back(kps_r[matches[m].trainIdx].pt);
+        }
+    }
+}
+
+void VO_estimator::triangulate_correspondences()
+{
+    // undistortion
+    vector<Point2d> undistort_l, undistort_r;
+    undistortPoints(this->new_matches_on_img_l, undistort_l, this->K_l, this->dist_l, Mat::eye(3, 3, CV_64F), this->projMat_l);
+    undistortPoints(this->new_matches_on_img_r, undistort_r, this->K_r, this->dist_r, Mat::eye(3, 3, CV_64F), this->projMat_r);
+    for(int m = this->new_matches_on_img_l.size() - 1; m > -1; m--)
+    {
+        Mat score;
+        Mat q = (Mat_<double>(1, 3) << undistort_r[m].x, undistort_r[m].y, 1);
+        Mat p = (Mat_<double>(3, 1) << undistort_l[m].x, undistort_l[m].y, 1);
+        score = q * this->F * p;
+        // filter 1: geometry based
+        if(fabs(score.at<double>(0,0)) < 0.003)
+        {
+            Mat p3d_;
+            double x_, y_, z_, w_;
+            // triangulation
+            triangulatePoints(this->projMat_l, this->projMat_r, Mat(undistort_l[m]), Mat(undistort_r[m]), p3d_);
+            w_ = p3d_.at<double>(3, 0);
+            z_ = p3d_.at<double>(2, 0) / w_;
+            // filter 2: positive depth
+            if((z_ > 0.5) && (z_ < 30))
+            {
+                x_ = p3d_.at<double>(0, 0) / w_;
+                y_ = p3d_.at<double>(1, 0) / w_;
+                // transform the landmark to world frame
+                Mat p_ = (Mat_<double>(3, 1) << x_, y_, z_);
+                p_ = this->rmat_w * p_ + this->tvec_w;
+                this->landmarks.push_back(Point3d(p_.at<double>(0,0), p_.at<double>(1,0), p_.at<double>(2,0)));
+                this->landmarks_on_img_l.push_back(Point2f(this->new_matches_on_img_l[m]));
+            }
+            else
+            {
+                this->new_matches_on_img_l.erase(this->new_matches_on_img_l.begin() + m);
+                this->new_matches_on_img_r.erase(this->new_matches_on_img_r.begin() + m);
+            }
+        }
+        else
+        {
+            this->new_matches_on_img_l.erase(this->new_matches_on_img_l.begin() + m);
+            this->new_matches_on_img_r.erase(this->new_matches_on_img_r.begin() + m);
+        }
+    }
+}
+
 void VO_estimator::process()
 {
     cout << "--------------------" << endl;
@@ -97,100 +256,18 @@ void VO_estimator::process()
     // track the previous feature (standard only)
     if((this->landmarks.size() > 0) && ~(this->img_l_prev.empty()))
     {
-        cout << "standard" << endl;
-        vector<uchar> status;
-	    vector<float> err;
-        vector<Point2f> tracked;
-        calcOpticalFlowPyrLK(this->img_l_prev, this->img_l, this->landmarks_on_img_l, tracked, status, err, Size(11, 11), 3, TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 30, 0.01));
-        // only restore the well-tracked points
-        for(int p = status.size()-1; p > -1; p--)
-        {
-            if((int)(status[p]) != 1)
-            {
-                tracked.erase(tracked.begin() + p);
-                this->landmarks.erase(this->landmarks.begin() + p);
-            }
-        }
-        this->landmarks_on_img_l = tracked;
-        cout << "[DEBUG]\t" << "Successfully track: " << this->landmarks.size() << endl;
-        // RANSAC filter out outliners
-        vector<int> inliers;
-        solvePnPRansac(this->landmarks, this->landmarks_on_img_l, this->K_l, this->dist_l, this->rvec_pnp, this->tvec_pnp, true, 100, 100.0, 0.99, inliers, CV_P3P);
-        vector<Point3d> landmarks_inliers;
-        vector<Point2f> landmarks_on_img_l_inliers;
-        for(int i = 0; i < inliers.size(); i++)
-        {
-            landmarks_inliers.push_back(this->landmarks[inliers[i]]);
-            landmarks_on_img_l_inliers.push_back(this->landmarks_on_img_l[inliers[i]]);
-        }
-        this->landmarks = landmarks_inliers;
-        this->landmarks_on_img_l = landmarks_on_img_l_inliers;
+        track_landmarks();
     }
     // the case new landmarks need to be added 
+    // if(this->landmarks.size() == 0)
     if(this->landmarks.size() < this->n_landmarks_l)
     {
         cout << "keyframe" << endl;
-        // extract feature points
-        vector<KeyPoint> pts_l, pts_r; // grid adapted detector is more preferable
-        // number of feature going to extract
-        int n_feature_need = 1.3 * (this->n_landmarks_u - this->landmarks.size());
-        Ptr<ORB> orb = ORB::create(n_feature_need, 1, 1, 31, 0, 2, ORB::FAST_SCORE, 31, 10);
-        orb->detect(this->img_l, pts_l);
-        orb->detect(this->img_r, pts_r);
-        // compute descriptors
-        Mat des_l, des_r;
-        orb->compute(this->img_l, pts_l, des_l);
-        orb->compute(this->img_r, pts_r, des_r);
-        // match them
-        vector<DMatch> matches; // this can be faster, because we know the F
-        BFMatcher bfMatcher(NORM_HAMMING);
-        if(pts_l.size() > 0 && pts_r.size() > 0)
+        extract_correspondences(15);
+        if(this->new_matches_on_img_l.size() > 0)
         {
-            bfMatcher.match(des_l, des_r, matches);
-            // compute score for each correspondences
-            vector<float> scores;
-            int n_good_matches = 0;
-            for(int m = 0; m < matches.size(); m++)
-            {
-                Mat score;
-                Mat q = (Mat_<double>(1, 3) << pts_r[matches[m].trainIdx].pt.x, pts_r[matches[m].trainIdx].pt.y, 1);
-                Mat p = (Mat_<double>(3, 1) << pts_l[matches[m].queryIdx].pt.x, pts_l[matches[m].queryIdx].pt.y, 1);
-                score = q * this->F * p;
-                if(fabs(score.at<double>(0,0)) < 0.003)
-                {
-                    n_good_matches++;
-                }
-                scores.push_back(fabs(score.at<double>(0,0)));
-            }
-            // make an vector of index
-            vector<int> idx(scores.size());
-            size_t n(0);
-            generate(begin(idx), end(idx), [&]{return n++;});
-            // sort the score and return corresponding index
-            sort(begin(idx), end(idx), [&](int x, int y){return scores[x] < scores[y];});
-            for(int m = 0; m < ((n_good_matches > this->n_landmarks_u - landmarks.size())?this->n_landmarks_u - landmarks.size():n_good_matches) ; m++)
-            {
-                this->new_matches_on_img_l.push_back(pts_l[matches[idx[m]].queryIdx].pt);
-                this->new_matches_on_img_r.push_back(pts_r[matches[idx[m]].trainIdx].pt);
-            }
-            Mat new_landmarks;
-            triangulatePoints(this->projMat_l, this->projMat_r, new_matches_on_img_l, new_matches_on_img_r, new_landmarks);
-            // rescale the 3d point
-            for(int p = 0; p < new_landmarks.cols; p++)
-            {
-                new_landmarks.at<double>(0, p) = new_landmarks.at<double>(0, p) / new_landmarks.at<double>(3, p);
-                new_landmarks.at<double>(1, p) = new_landmarks.at<double>(1, p) / new_landmarks.at<double>(3, p);
-                new_landmarks.at<double>(2, p) = new_landmarks.at<double>(2, p) / new_landmarks.at<double>(3, p);
-                // add result (3d) to the estimator
-                this->landmarks.push_back(Point3d(new_landmarks.at<double>(0, p), new_landmarks.at<double>(1, p), new_landmarks.at<double>(2, p)));
-            }
-            // add result (2d) to the estimator
-            this->landmarks_on_img_l.insert(this->landmarks_on_img_l.end(), new_matches_on_img_l.begin(), new_matches_on_img_l.end());
+            triangulate_correspondences();
         }
-    }
-    else
-    {
-
     }
 }
 
@@ -225,6 +302,7 @@ void visualization(VO_estimator estimator)
         hconcat(estimator.img_l, estimator.img_r, show);
         cvtColor(show, show, CV_GRAY2RGB);
         Point2d bais(estimator.img_l.cols, 0);
+        // draw new matches
         for(int f = 0; f < estimator.landmarks_on_img_l.size(); f++)
         {
             circle(show, estimator.landmarks_on_img_l[f], 1, Scalar(0, 255, 0), 3);
@@ -235,7 +313,21 @@ void visualization(VO_estimator estimator)
             circle(show, estimator.new_matches_on_img_l[m], 1, Scalar(0, 0, 255), 3);
             circle(show, estimator.new_matches_on_img_r[m] + bais, 1, Scalar(0, 0, 255), 3);
         }
+        // draw map
+        Mat map_2d = Mat::ones(500,500,CV_8UC3);
+        // draw landmarks
+        Point2d l_;
+        for(int l = 0; l < estimator.landmarks.size(); l++)
+        {
+            l_.x = estimator.landmarks[l].x * 15 + map_2d.rows / 2;
+            l_.y = -estimator.landmarks[l].z * 15 + map_2d.cols / 2;
+            circle(map_2d, l_, 1, Scalar(0, 255, 0), 1.3);
+        }
+        // draw boay
+        circle(map_2d, Point2d(estimator.tvec_w.at<double>(0,0) * 15 + map_2d.rows / 2, -estimator.tvec_w.at<double>(2,0) * 15 + map_2d.cols / 2), 1, Scalar(0, 0, 255), 3);
+        // show
         imshow("Image",show);
+        imshow("Map", map_2d);
         waitKey(50);
     }
 }
@@ -278,6 +370,7 @@ int main() {
         clock_t clockTicksTaken = endTime - startTime;
         double timeInSeconds = clockTicksTaken / (double) CLOCKS_PER_SEC;
         cout << "time: " << timeInSeconds << endl;
+        cout << "position: \n" << my_estimator.tvec_w << endl;
         // visualization
         visualization(my_estimator);
     }
