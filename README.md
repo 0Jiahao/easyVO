@@ -8,5 +8,5 @@ The dataset we are using to verify this approach is the [EuRoC MAV Dataset](http
 <div align=center><img width="640" src="https://github.com/0Jiahao/easyVO/blob/master/result.gif"/></div> 
 
 ### Future Work
-- Adding Bundle Adjustment or EKF for 3D Point refinement.
+- Adding Bundle Adjustment or EKF for refinement.
 - Adding keyframe alignment (short-term loop closure).
