@@ -14,6 +14,7 @@
 #include <opencv2/video/tracking.hpp>
 #include <opencv2/imgproc/types_c.h>
 #include <opencv2/xfeatures2d.hpp>
+#include <cvsba/cvsba.h>
 
 using namespace std;
 using namespace cv;
@@ -35,14 +36,22 @@ class VO_estimator
     Mat img_r;                                  // right image
     Mat rmat_w;                                 // rotation world frame
     Mat tvec_w;                                 // translation world frame
-    int n_landmarks_l;                          // number of landmarks desired(lower bound)
-    int n_landmarks_u;                          // number of landmarks (upper bound)
     vector<Point3d> landmarks;                  // 3d points for tracking 
     vector<Point2f> landmarks_on_img_l;         // 2d points for tracking (on left image)
-    int vstep;                                  // vertical step (image segamentation)
-    int hstep;                                  // horizontal step
     vector<Point2d> new_matches_on_img_l;       // new added matches on left image
     vector<Point2d> new_matches_on_img_r;       // ...               on right image
+    bool is_keyframe;                           // flag of keyfrome judgment
+    cvsba::Sba sba;                             // sparse bundle adjustment
+    vector<int> index_tracking;                 // the index of landmarks that are tracking
+    vector<Point3d> sba_point_3d;
+    vector<vector<Point2d>> sba_point_2d;
+    vector<vector<int>> sba_visibility;
+    vector<Mat> sba_R, sba_T, sba_Kv, sba_distv;
+    int NPOINTS;                                // number of landmarks from latest keyframe
+    int NCAMS;                                  // the frame index from latest keyframe
+    Mat sba_dist;
+    Mat tvec_pnp;
+    Mat rvec_pnp;
 
     // constructor
     VO_estimator();
@@ -60,17 +69,30 @@ class VO_estimator
     void update_projMat();
     // estimator process
     void process();
+    // initialize sba
+    void init_sba();
+    // update sba
+    void update_sba();
 };
 
 VO_estimator::VO_estimator()
 {
     this->isempty = true;
-    this->n_landmarks_l = 150;
-    this->n_landmarks_u = 225;
     this->rmat_w = Mat::eye(3, 3, CV_64F);
-    this->tvec_w = (Mat_<double>(3, 1) << 0,0,0);
-    this->vstep = 6;
-    this->hstep = 8;
+    this->tvec_w = (Mat_<double>(3, 1) << 0, 0, 0);
+    this->is_keyframe = true;
+    // initialization of sba
+    this->NCAMS = 1;
+    cvsba::Sba::Params params;
+    params.type = cvsba::Sba::MOTION;
+    params.iterations = 150;
+    params.minError = 1e-10;
+    params.fixedIntrinsics = 5;
+    params.fixedDistortion = 5;
+    params.verbose = false;
+    this->sba.setParams(params);
+    this->rvec_pnp = (Mat_<double>(3, 1) << 0, 0, 0);
+    this->tvec_pnp = (Mat_<double>(3, 1) << 0, 0, 0);
 }
 
 void VO_estimator::read_stereo_camera_param(Mat rot_l, Mat K_l, Mat dist_l, Mat rot_r, Mat K_r, Mat dist_r)
@@ -94,6 +116,13 @@ void VO_estimator::read_stereo_camera_param(Mat rot_l, Mat K_l, Mat dist_l, Mat 
     double tz = Tlr.at<double>(0,2);
     Mat Tx = (Mat_<double>(3, 3) << 0, -tz, ty, tz, 0, -tx, -ty, tx, 0);
     this->F = K_r.inv().t() * rot_r(Rect(0, 0, 3, 3)) * rot_l(Rect(0, 0, 3, 3)).t() * Tx * K_l.inv();
+    // camera matrix for sba (s = 1, k3 = 0)
+    double k1, k2, p1, p2;
+    k1 = this->dist_l.at<double>(0,0);
+    k2 = this->dist_l.at<double>(0,1);
+    p1 = this->dist_l.at<double>(0,2);
+    p2 = this->dist_l.at<double>(0,3);
+    this->sba_dist = (Mat_<double>(1, 5) << k1, k2, p1, p2, 0);
 }
 
 void VO_estimator::read_new_frame(Mat img0, Mat img1)
@@ -104,48 +133,105 @@ void VO_estimator::read_new_frame(Mat img0, Mat img1)
     this->isempty = ((this->img_l.empty()) || (this->img_r.empty()));
 }
 
+void VO_estimator::update_sba()
+{
+    this->sba_R.push_back(this->rvec_pnp);
+    this->sba_T.push_back(this->tvec_pnp);
+    this->sba_Kv.push_back(this->K_l);
+    this->sba_distv.push_back(this->sba_dist);
+    this->sba_point_2d.resize(this->NCAMS);
+    this->sba_point_2d[this->NCAMS - 1].resize(this->NPOINTS);
+    this->sba_visibility.resize(this->NCAMS);
+    this->sba_visibility[this->NCAMS - 1].resize(this->NPOINTS);
+    int i = 0;
+    for(int p = 0; p < this->NPOINTS; p++)
+    {
+        vector<int>::iterator it;
+        it = find(this->index_tracking.begin(), this->index_tracking.end(), p);
+        if(it != this->index_tracking.end())
+        {
+            this->sba_point_2d[this->NCAMS - 1][p] = Point2d(this->landmarks_on_img_l[i]);
+            this->sba_visibility[this->NCAMS - 1][p] = 1;
+            i++;
+        }
+        else
+        {
+            this->sba_visibility[this->NCAMS - 1][p] = 0;
+        }
+    }
+    this->sba.run(this->sba_point_3d, this->sba_point_2d, this->sba_visibility, this->sba_Kv, this->sba_R, this->sba_T, this->sba_distv);
+    // update the pose
+    Mat rmat_pnp;
+    Rodrigues(this->sba_R[this->NCAMS - 1], rmat_pnp);
+    this->rmat_w = rmat_pnp.inv();
+    this->tvec_w = -rmat_pnp.inv() * this->sba_T[this->NCAMS - 1];
+}
+
 void VO_estimator::track_landmarks()
 {
     vector<uchar> status;
     vector<float> err;
     vector<Point2f> tracked;
-    calcOpticalFlowPyrLK(this->img_l_prev, this->img_l, this->landmarks_on_img_l, tracked, status, err, Size(11, 11), 6, TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 30, 0.01));
+    calcOpticalFlowPyrLK(this->img_l_prev, this->img_l, this->landmarks_on_img_l, tracked, status, err, Size(21, 21), 6, TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 30, 0.01), 0, 1e-4);
     // remove untracked landmarks
-    for(int p = status.size()-1; p > -1; p--)
+    vector<Point3d> tracked_3d;
+    vector<Point2f> tracked_2d;
+    vector<int> tracked_index;
+    for(int i = 0; i < status.size(); i++)
     {
-        if((int)(status[p]) != 1)
+        if(((bool)(status[i] == 1)))
         {
-            tracked.erase(tracked.begin() + p);
-            this->landmarks.erase(this->landmarks.begin() + p);
+            tracked_3d.push_back(this->landmarks[i]);
+            tracked_2d.push_back(tracked[i]);
+            tracked_index.push_back(this->index_tracking[i]);
         }
     }
-    this->landmarks_on_img_l = tracked;
     // estimate rotation and translation
     vector<int> inliers;
-    Mat rvec_pnp, tvec_pnp, rmat_pnp;
-    solvePnPRansac(this->landmarks, this->landmarks_on_img_l, this->K_l, this->dist_l, rvec_pnp, tvec_pnp, true, 100, 15.0, 0.99, inliers, CV_P3P);
-    Rodrigues(rvec_pnp, rmat_pnp);
+    Mat rmat_pnp;
+    solvePnPRansac(tracked_3d, tracked_2d, this->K_l, this->dist_l, this->rvec_pnp, this->tvec_pnp, true, 100, 5.0, 0.99, inliers, CV_EPNP);
+    Rodrigues(this->rvec_pnp, rmat_pnp);
     // inverse the rotation and translation
     this->rmat_w = rmat_pnp.inv();
-    this->tvec_w = -rmat_pnp.inv() * tvec_pnp;
+    this->tvec_w = -rmat_pnp.inv() * this->tvec_pnp;
     // RANSAC filter out outliners
-    vector<Point3d> landmarks_inliers;
-    vector<Point2f> landmarks_on_img_l_inliers;
+    vector<Point3d> inliers_3d;
+    vector<Point2f> inliers_2d;
+    vector<int> inliers_index;
     for(int i = 0; i < inliers.size(); i++)
     {
-        landmarks_inliers.push_back(this->landmarks[inliers[i]]);
-        landmarks_on_img_l_inliers.push_back(this->landmarks_on_img_l[inliers[i]]);
+        inliers_3d.push_back(tracked_3d[inliers[i]]);
+        inliers_2d.push_back(tracked_2d[inliers[i]]);
+        inliers_index.push_back(tracked_index[inliers[i]]);
     }
-    this->landmarks = landmarks_inliers;
-    this->landmarks_on_img_l = landmarks_on_img_l_inliers;
+    this->landmarks = inliers_3d;
+    this->landmarks_on_img_l = inliers_2d;
+    this->index_tracking = inliers_index;
+    // keyframe judegment
+    this->is_keyframe = (this->landmarks.size() / (float)this->NPOINTS > 0.8)?false:true;
+    // NCAMS too big also need to create a new key frame
+    if(this->NCAMS > 20)
+    {
+        this->is_keyframe = true;
+    }
+    if(this->is_keyframe)
+    {
+        this->NCAMS = 1;
+        cout << "next is keyframe" << endl;
+    }
+    else
+    {
+        this->NCAMS++;
+        update_sba();
+    }
 }
 
 void VO_estimator::extract_correspondences(int d)
 {
     // extract feature points
     vector<KeyPoint> kps_l, kps_r; // grid adapted detector is more preferable
-    FAST(this->img_l, kps_l, 50, true, FastFeatureDetector::TYPE_9_16);
-    FAST(this->img_r, kps_r, 50, true, FastFeatureDetector::TYPE_9_16);
+    FAST(this->img_l, kps_l, 30, true, FastFeatureDetector::TYPE_9_16);
+    FAST(this->img_r, kps_r, 30, true, FastFeatureDetector::TYPE_9_16);
     // sort kps_l by response
     sort(kps_l.begin(), kps_l.end(), [](KeyPoint& a, KeyPoint& b){return a.response > b.response;});
     // filter out features base on distance
@@ -180,7 +266,6 @@ void VO_estimator::extract_correspondences(int d)
     }
     // compute descriptors
     Mat des_l, des_r;
-    Ptr<DescriptorExtractor> freak = xfeatures2d::FREAK::create();
     Ptr<DescriptorExtractor> orb = ORB::create();
     orb->compute(this->img_l, kps_l, des_l);
     orb->compute(this->img_r, kps_r, des_r);
@@ -197,6 +282,34 @@ void VO_estimator::extract_correspondences(int d)
             this->new_matches_on_img_r.push_back(kps_r[matches[m].trainIdx].pt);
         }
     }
+}
+
+void VO_estimator::init_sba()
+{
+    cout << "/********** INITIALIZATION **********/" << endl;
+    this->sba_point_2d.clear();
+    this->sba_visibility.clear();
+    this->sba_R.clear();
+    this->sba_T.clear();
+    this->sba_Kv.clear();
+    this->sba_distv.clear();
+    this->sba_point_3d .clear();
+    this->sba_point_3d.resize(this->NPOINTS);
+    this->sba_point_2d.resize(1);
+    this->sba_point_2d[0].resize(this->NPOINTS);
+    this->sba_visibility.resize(1);
+    this->sba_visibility[0].resize(this->NPOINTS);
+    vector<int> visibility;
+    for(int p = 0; p < this->NPOINTS; p++)
+    {
+        this->sba_point_3d[p] = Point3d(this->landmarks[p]);
+        this->sba_point_2d[0][p] = Point2d(this->landmarks_on_img_l[p]);
+        this->sba_visibility[0][p] = 1;
+    }
+    this->sba_R.push_back(this->rvec_pnp);
+    this->sba_T.push_back(this->tvec_pnp);
+    this->sba_Kv.push_back(this->K_l);
+    this->sba_distv.push_back(this->sba_dist);
 }
 
 void VO_estimator::triangulate_correspondences()
@@ -243,11 +356,20 @@ void VO_estimator::triangulate_correspondences()
             this->new_matches_on_img_r.erase(this->new_matches_on_img_r.begin() + m);
         }
     }
+    // update the number of landmarks from the latest keyframe
+    this->NPOINTS = this->landmarks.size();
+    // initialize the index_tracking
+    this->index_tracking.clear();
+    for(int p = 0; p < this->NPOINTS; p++)
+    {
+        index_tracking.push_back(p);
+    }
+    // initialize the sba
+    init_sba();
 }
 
 void VO_estimator::process()
 {
-    cout << "--------------------" << endl;
     this->new_matches_on_img_l.clear();
     this->new_matches_on_img_r.clear();
     // track the previous feature (standard only)
@@ -256,9 +378,9 @@ void VO_estimator::process()
         track_landmarks();
     }
     // the case new landmarks need to be added 
-    if(this->landmarks.size() < this->n_landmarks_l)
+    if(this->is_keyframe)
     {
-        extract_correspondences(30);
+        extract_correspondences(25);
         if(this->new_matches_on_img_l.size() > 0)
         {
             triangulate_correspondences();
@@ -292,9 +414,10 @@ vector<unsigned long long> extract_timestamps(const char *path)
 void visualization(VO_estimator estimator, float timeInSeconds)
 {
     static vector<Point2d> trajectory;
+    static vector<Point2d> keyframes;
     if(~estimator.isempty)
     {
-        float factor = 15;
+        float factor = 20;
         Mat show;
         cvtColor(estimator.img_l, show, CV_GRAY2RGB);
         // draw new matches
@@ -320,6 +443,18 @@ void visualization(VO_estimator estimator, float timeInSeconds)
                 line(map_2d, trajectory[t-1], trajectory[t], Scalar(175, 175, 175), 2);
             }
         }
+        // draw keyframe sign
+        if(estimator.is_keyframe)
+        {
+            // update keyframes
+            keyframes.push_back(body);
+            rectangle(show, Point2f(0, 0), Point2f(show.cols, show.rows), Scalar(0, 0, 255), 10, 8, 0);
+        }
+        // draw keyframes
+        for(int t = 0; t < keyframes.size(); t++)
+        {
+            circle(map_2d, keyframes[t], 1, Scalar(0, 0, 255), 2);  
+        }
         // draw landmarks
         Point2d l_;
         for(int l = 0; l < estimator.landmarks.size(); l++)
@@ -332,9 +467,9 @@ void visualization(VO_estimator estimator, float timeInSeconds)
         Mat axis = (Mat_<double>(3, 1) << 0, 0, 25);
         axis = estimator.rmat_w * axis;
         Point2d arrow(axis.at<double>(0, 0), -axis.at<double>(2, 0));
-        line(map_2d, body, body + arrow, Scalar(0, 0, 255), 2);
+        line(map_2d, body, body + arrow, Scalar(255, 0, 0), 2);
         // draw body
-        circle(map_2d, body, 1, Scalar(0, 0, 255), 5);
+        circle(map_2d, body, 1, Scalar(255, 0, 0), 5);
         // write informations
         string text;
         text = to_string(timeInSeconds);
@@ -352,7 +487,7 @@ void visualization(VO_estimator estimator, float timeInSeconds)
         hconcat(show, map_2d, show);
         // show
         imshow("Visualization",show);
-        waitKey(1);
+        waitKey(20);
     }
 }
 
@@ -393,7 +528,7 @@ int main() {
         clock_t endTime = clock();
         clock_t clockTicksTaken = endTime - startTime;
         double timeInSeconds = clockTicksTaken / (double) CLOCKS_PER_SEC;
-        cout << "time: " << timeInSeconds << endl;
+        cout << "time:\t" << timeInSeconds << endl;
         // visualization
         visualization(my_estimator, timeInSeconds);
     }
