@@ -8,7 +8,7 @@ This project is mainly built based on [eVO](http://w3.onera.fr/copernic/sites/w3
 - [OpenCV](https://opencv.org/).
 
 ### Data Set
-The dataset we are using to verify this approach is the [EuRoC MAV Dataset](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets).
+We evaluate the preformance of this approach with [EuRoC MAV Dataset](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets).
 
 ### Result
 <div align=center><img width="640" src="https://github.com/0Jiahao/easyVO/blob/master/result.gif"/></div> 
