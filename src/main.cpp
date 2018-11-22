@@ -1,3 +1,4 @@
+// TODO: triangulation should be after the sba
 #include <iostream>
 #include <dirent.h>
 #include <sys/types.h>
@@ -38,9 +39,11 @@ class VO_estimator
     Mat tvec_w;                                 // translation world frame
     vector<Point3d> landmarks;                  // 3d points for tracking 
     vector<Point2f> landmarks_on_img_l;         // 2d points for tracking (on left image)
+    vector<Point3d> new_landmarks;              // new 3d points via triangulation
     vector<Point2d> new_matches_on_img_l;       // new added matches on left image
     vector<Point2d> new_matches_on_img_r;       // ...               on right image
     bool is_keyframe;                           // flag of keyfrome judgment
+    int n_ba_size;
     cvsba::Sba sba;                             // sparse bundle adjustment
     vector<int> index_tracking;                 // the index of landmarks that are tracking
     vector<Point3d> sba_point_3d;
@@ -69,8 +72,8 @@ class VO_estimator
     void update_projMat();
     // estimator process
     void process();
-    // initialize sba
-    void init_sba();
+    // construct sba
+    void construct_sba();
     // update sba
     void update_sba();
 };
@@ -85,7 +88,7 @@ VO_estimator::VO_estimator()
     this->NCAMS = 1;
     cvsba::Sba::Params params;
     params.type = cvsba::Sba::MOTION;
-    params.iterations = 150;
+    params.iterations = 75;
     params.minError = 1e-10;
     params.fixedIntrinsics = 5;
     params.fixedDistortion = 5;
@@ -93,6 +96,7 @@ VO_estimator::VO_estimator()
     this->sba.setParams(params);
     this->rvec_pnp = (Mat_<double>(3, 1) << 0, 0, 0);
     this->tvec_pnp = (Mat_<double>(3, 1) << 0, 0, 0);
+    this->n_ba_size = 10;
 }
 
 void VO_estimator::read_stereo_camera_param(Mat rot_l, Mat K_l, Mat dist_l, Mat rot_r, Mat K_r, Mat dist_r)
@@ -135,36 +139,152 @@ void VO_estimator::read_new_frame(Mat img0, Mat img1)
 
 void VO_estimator::update_sba()
 {
+    // new data for curent frame
+    vector<int> new_visibility;
+    vector<Point2d> new_point_2d; 
+    int prev_idx = 0;
+    int idx_i = 0;
+    for(int np = 0; np < this->sba_point_3d.size(); np++)
+    {
+        if(this->sba_visibility[this->sba_visibility.size() - 1][np] == 1)
+        {
+            if(prev_idx == this->index_tracking[idx_i])
+            {
+                new_visibility.push_back(1);
+                new_point_2d.push_back(Point2d(this->landmarks_on_img_l[idx_i]));
+                idx_i++;
+            }
+            else
+            {
+                new_visibility.push_back(0);
+                new_point_2d.push_back(Point2d(0, 0));
+            }
+            prev_idx++;
+        }
+        else
+        {
+            new_visibility.push_back(0);
+            new_point_2d.push_back(Point2d(0, 0));
+        }
+    }
+    // add new data to matrix
+    this->sba_visibility.push_back(new_visibility);
+    this->sba_point_2d.push_back(new_point_2d);
     this->sba_R.push_back(this->rvec_pnp);
     this->sba_T.push_back(this->tvec_pnp);
     this->sba_Kv.push_back(this->K_l);
     this->sba_distv.push_back(this->sba_dist);
-    this->sba_point_2d.resize(this->NCAMS);
-    this->sba_point_2d[this->NCAMS - 1].resize(this->NPOINTS);
-    this->sba_visibility.resize(this->NCAMS);
-    this->sba_visibility[this->NCAMS - 1].resize(this->NPOINTS);
-    int i = 0;
-    for(int p = 0; p < this->NPOINTS; p++)
+    this->sba.run(this->sba_point_3d, this->sba_point_2d, this->sba_visibility, this->sba_Kv, this->sba_R, this->sba_T, this->sba_distv);
+    if(this->sba.getFinalReprjError() < 200)
     {
-        vector<int>::iterator it;
-        it = find(this->index_tracking.begin(), this->index_tracking.end(), p);
-        if(it != this->index_tracking.end())
+        // inverse the rotation and translation
+        Mat rmat;
+        Rodrigues(this->sba_R[this->sba_R.size() - 1], rmat);
+        this->rmat_w = rmat.inv();
+        this->tvec_w = -rmat.inv() * this->sba_T[this->sba_T.size() - 1];
+    }
+    // remove current data
+    this->sba_visibility.pop_back();
+    this->sba_point_2d.pop_back();
+    this->sba_R.pop_back();
+    this->sba_T.pop_back();
+    this->sba_Kv.pop_back();
+    this->sba_distv.pop_back();
+}
+
+void VO_estimator::construct_sba()
+{
+    cout << "/********/" << endl;
+    if(this->sba_visibility.size() == this->n_ba_size)
+    {
+        // erase old data
+        this->sba_visibility.erase(this->sba_visibility.begin());
+        this->sba_point_2d.erase(this->sba_point_2d.begin());
+        this->sba_R.erase(this->sba_R.begin());
+        this->sba_T.erase(this->sba_T.begin());
+        this->sba_Kv.erase(this->sba_Kv.begin());
+        this->sba_distv.erase(this->sba_distv.begin());
+    }
+    // remove invisible points
+    vector<int> visibilities;
+    for(int np = 0; np < this->sba_point_3d.size(); np++)
+    {
+        int visibility = 0;
+        for(int nc = 0; nc < this->sba_visibility.size(); nc++)
         {
-            this->sba_point_2d[this->NCAMS - 1][p] = Point2d(this->landmarks_on_img_l[i]);
-            this->sba_visibility[this->NCAMS - 1][p] = 1;
-            i++;
+            visibility = visibility + this->sba_visibility[nc][np];
         }
-        else
+        visibilities.push_back(visibility);
+    }
+    for(int np = this->sba_point_3d.size() - 1; np > -1; np--)
+    {
+        if(visibilities[np] == 0)
         {
-            this->sba_visibility[this->NCAMS - 1][p] = 0;
+            this->sba_point_3d.erase(this->sba_point_3d.begin() + np);
+            for(int nc = 0; nc < this->sba_visibility.size(); nc++)
+            {
+                this->sba_point_2d[nc].erase(this->sba_point_2d[nc].begin() + np);
+                this->sba_visibility[nc].erase(this->sba_visibility[nc].begin() + np);
+            }
         }
     }
-    this->sba.run(this->sba_point_3d, this->sba_point_2d, this->sba_visibility, this->sba_Kv, this->sba_R, this->sba_T, this->sba_distv);
-    // update the pose
-    Mat rmat_pnp;
-    Rodrigues(this->sba_R[this->NCAMS - 1], rmat_pnp);
-    this->rmat_w = rmat_pnp.inv();
-    this->tvec_w = -rmat_pnp.inv() * this->sba_T[this->NCAMS - 1];
+    // add new points
+    this->sba_point_3d.insert(this->sba_point_3d.end(), this->new_landmarks.begin(), this->new_landmarks.end());
+    for(int nc = 0; nc < this->sba_visibility.size(); nc++)
+    {
+        for (int i = 0; i < this->new_landmarks.size(); i++)
+        {
+            this->sba_visibility[nc].push_back(0);
+            this->sba_point_2d[nc].push_back(Point2d(0, 0));
+        }
+    }
+    // adding new row
+    vector<int> new_visibility;
+    vector<Point2d> new_point_2d; 
+    // from old to new visibility (visibility)
+    if(this->sba_visibility.size() > 0)
+    {
+        int prev_idx = 0;
+        int idx_i = 0;
+        for(int np = 0; np < this->sba_point_3d.size() - this->new_landmarks.size(); np++)
+        {
+            if(this->sba_visibility[this->sba_visibility.size() - 1][np] == 1)
+            {
+                if(prev_idx == this->index_tracking[idx_i])
+                {
+                    new_visibility.push_back(1);
+                    new_point_2d.push_back(Point2d(this->landmarks_on_img_l[idx_i]));
+                    idx_i++;
+                }
+                else
+                {
+                    new_visibility.push_back(0);
+                    new_point_2d.push_back(Point2d(0, 0));
+                }
+                prev_idx++;
+            }
+            else
+            {
+                new_visibility.push_back(0);
+                new_point_2d.push_back(Point2d(0, 0));
+            }
+        }
+    }
+    // from new matches
+    cout << "size new 2d:" << new_point_2d.size() << endl;
+    for(int np = this->new_landmarks.size() - 1; np > -1; np--)
+    {
+        new_visibility.push_back(1);
+        new_point_2d.push_back(this->new_matches_on_img_l[np]);
+    }
+    // add new data to matrix
+    this->sba_visibility.push_back(new_visibility);
+    this->sba_point_2d.push_back(new_point_2d);
+    // add new data (R, T, K, dist)
+    this->sba_R.push_back(this->rvec_pnp);
+    this->sba_T.push_back(this->tvec_pnp);
+    this->sba_Kv.push_back(this->K_l);
+    this->sba_distv.push_back(this->sba_dist);
 }
 
 void VO_estimator::track_landmarks()
@@ -172,7 +292,7 @@ void VO_estimator::track_landmarks()
     vector<uchar> status;
     vector<float> err;
     vector<Point2f> tracked;
-    calcOpticalFlowPyrLK(this->img_l_prev, this->img_l, this->landmarks_on_img_l, tracked, status, err, Size(21, 21), 6, TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 30, 0.01), 0, 1e-4);
+    calcOpticalFlowPyrLK(this->img_l_prev, this->img_l, this->landmarks_on_img_l, tracked, status, err, Size(15, 15), 6, TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 30, 0.01), 0, 1e-4);
     // remove untracked landmarks
     vector<Point3d> tracked_3d;
     vector<Point2f> tracked_2d;
@@ -188,12 +308,11 @@ void VO_estimator::track_landmarks()
     }
     // estimate rotation and translation
     vector<int> inliers;
-    Mat rmat_pnp;
-    solvePnPRansac(tracked_3d, tracked_2d, this->K_l, this->dist_l, this->rvec_pnp, this->tvec_pnp, true, 100, 5.0, 0.99, inliers, CV_EPNP);
-    Rodrigues(this->rvec_pnp, rmat_pnp);
-    // inverse the rotation and translation
-    this->rmat_w = rmat_pnp.inv();
-    this->tvec_w = -rmat_pnp.inv() * this->tvec_pnp;
+    solvePnPRansac(tracked_3d, tracked_2d, this->K_l, this->dist_l, this->rvec_pnp, this->tvec_pnp, true, 100, 5.0, 0.99, inliers, CV_P3P);
+    Mat rmat;
+    Rodrigues(this->rvec_pnp, rmat);
+    this->rmat_w = rmat.inv();
+    this->tvec_w = -rmat.inv() * this->tvec_pnp;
     // RANSAC filter out outliners
     vector<Point3d> inliers_3d;
     vector<Point2f> inliers_2d;
@@ -207,22 +326,17 @@ void VO_estimator::track_landmarks()
     this->landmarks = inliers_3d;
     this->landmarks_on_img_l = inliers_2d;
     this->index_tracking = inliers_index;
+    update_sba();
     // keyframe judegment
     this->is_keyframe = (this->landmarks.size() / (float)this->NPOINTS > 0.8)?false:true;
     // NCAMS too big also need to create a new key frame
-    if(this->NCAMS > 20)
-    {
-        this->is_keyframe = true;
-    }
     if(this->is_keyframe)
     {
         this->NCAMS = 1;
-        cout << "next is keyframe" << endl;
     }
     else
     {
         this->NCAMS++;
-        update_sba();
     }
 }
 
@@ -284,40 +398,13 @@ void VO_estimator::extract_correspondences(int d)
     }
 }
 
-void VO_estimator::init_sba()
-{
-    cout << "/********** INITIALIZATION **********/" << endl;
-    this->sba_point_2d.clear();
-    this->sba_visibility.clear();
-    this->sba_R.clear();
-    this->sba_T.clear();
-    this->sba_Kv.clear();
-    this->sba_distv.clear();
-    this->sba_point_3d .clear();
-    this->sba_point_3d.resize(this->NPOINTS);
-    this->sba_point_2d.resize(1);
-    this->sba_point_2d[0].resize(this->NPOINTS);
-    this->sba_visibility.resize(1);
-    this->sba_visibility[0].resize(this->NPOINTS);
-    vector<int> visibility;
-    for(int p = 0; p < this->NPOINTS; p++)
-    {
-        this->sba_point_3d[p] = Point3d(this->landmarks[p]);
-        this->sba_point_2d[0][p] = Point2d(this->landmarks_on_img_l[p]);
-        this->sba_visibility[0][p] = 1;
-    }
-    this->sba_R.push_back(this->rvec_pnp);
-    this->sba_T.push_back(this->tvec_pnp);
-    this->sba_Kv.push_back(this->K_l);
-    this->sba_distv.push_back(this->sba_dist);
-}
-
 void VO_estimator::triangulate_correspondences()
 {
     // undistortion
     vector<Point2d> undistort_l, undistort_r;
     undistortPoints(this->new_matches_on_img_l, undistort_l, this->K_l, this->dist_l, Mat::eye(3, 3, CV_64F), this->projMat_l);
     undistortPoints(this->new_matches_on_img_r, undistort_r, this->K_r, this->dist_r, Mat::eye(3, 3, CV_64F), this->projMat_r);
+    this->new_landmarks.clear();
     for(int m = this->new_matches_on_img_l.size() - 1; m > -1; m--)
     {
         Mat score;
@@ -325,7 +412,7 @@ void VO_estimator::triangulate_correspondences()
         Mat p = (Mat_<double>(3, 1) << undistort_l[m].x, undistort_l[m].y, 1);
         score = q * this->F * p;
         // filter 1: geometry based
-        if(fabs(score.at<double>(0,0)) < 0.003)
+        if(fabs(score.at<double>(0,0)) < 0.005)
         {
             Mat p3d_;
             double x_, y_, z_, w_;
@@ -334,7 +421,7 @@ void VO_estimator::triangulate_correspondences()
             w_ = p3d_.at<double>(3, 0);
             z_ = p3d_.at<double>(2, 0) / w_;
             // filter 2: positive depth
-            if((z_ > 0.5) && (z_ < 30))
+            if((z_ > 0.0) && (z_ < 20))
             {
                 x_ = p3d_.at<double>(0, 0) / w_;
                 y_ = p3d_.at<double>(1, 0) / w_;
@@ -342,6 +429,7 @@ void VO_estimator::triangulate_correspondences()
                 Mat p_ = (Mat_<double>(3, 1) << x_, y_, z_);
                 p_ = this->rmat_w * p_ + this->tvec_w;
                 this->landmarks.push_back(Point3d(p_.at<double>(0,0), p_.at<double>(1,0), p_.at<double>(2,0)));
+                this->new_landmarks.push_back(Point3d(p_.at<double>(0,0), p_.at<double>(1,0), p_.at<double>(2,0)));
                 this->landmarks_on_img_l.push_back(Point2f(this->new_matches_on_img_l[m]));
             }
             else
@@ -356,6 +444,7 @@ void VO_estimator::triangulate_correspondences()
             this->new_matches_on_img_r.erase(this->new_matches_on_img_r.begin() + m);
         }
     }
+    construct_sba();
     // update the number of landmarks from the latest keyframe
     this->NPOINTS = this->landmarks.size();
     // initialize the index_tracking
@@ -364,8 +453,6 @@ void VO_estimator::triangulate_correspondences()
     {
         index_tracking.push_back(p);
     }
-    // initialize the sba
-    init_sba();
 }
 
 void VO_estimator::process()
@@ -429,6 +516,21 @@ void visualization(VO_estimator estimator, float timeInSeconds)
         {
             circle(show, estimator.new_matches_on_img_l[m], 1, Scalar(0, 0, 255), 3);
         }
+        // // draw sba trace
+        // int n = 0;
+        // int nc = estimator.sba_visibility.size() - 1;
+        // if(estimator.sba_visibility.size() > 1)
+        // {
+        //     for(int i = 0; i < estimator.sba_point_3d.size(); i++)
+        //     {
+        //         if((estimator.sba_visibility[0][i] == 1) && (estimator.sba_visibility[1][i] == 1))
+        //         {
+        //             n++;
+        //             line(show, estimator.sba_point_2d[0][i], estimator.sba_point_2d[1][i], Scalar(175, 175, 175), 2);
+        //         }
+        //     }
+        //     cout << "draw " << n << "traces" << endl;
+        // }
         // draw map
         Mat map_2d = Mat::ones(480,480,CV_8UC3);
         // body point
@@ -487,7 +589,7 @@ void visualization(VO_estimator estimator, float timeInSeconds)
         hconcat(show, map_2d, show);
         // show
         imshow("Visualization",show);
-        waitKey(20);
+        waitKey(1);
     }
 }
 
