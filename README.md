@@ -14,5 +14,4 @@ We evaluate the preformance of this approach with [EuRoC MAV Dataset](https://pr
 <div align=center><img width="640" src="https://github.com/0Jiahao/easyVO/blob/master/result.gif"/></div> 
 
 ### Future Work
-- Adding keyframe alignment (short-term loop closure).
 - Make it as ROS node
