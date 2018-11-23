@@ -15,3 +15,4 @@ We evaluate the preformance of this approach with [EuRoC MAV Dataset](https://pr
 
 ### Future Work
 - Make it as ROS node
+
