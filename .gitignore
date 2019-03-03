@@ -1,4 +1,8 @@
 build/
 mav0/
+mav1/
+mav2/
+mav3/
 output/
 lib/
+.vscode/

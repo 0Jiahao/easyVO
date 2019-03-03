@@ -1,4 +1,3 @@
-// TODO: triangulation should be after the sba
 #include <iostream>
 #include <dirent.h>
 #include <sys/types.h>
@@ -16,6 +15,8 @@
 #include <opencv2/imgproc/types_c.h>
 #include <opencv2/xfeatures2d.hpp>
 #include <cvsba/cvsba.h>
+#include <sstream>
+#include <fstream>
 
 using namespace std;
 using namespace cv;
@@ -96,7 +97,7 @@ VO_estimator::VO_estimator()
     this->sba.setParams(params);
     this->rvec_pnp = (Mat_<double>(3, 1) << 0, 0, 0);
     this->tvec_pnp = (Mat_<double>(3, 1) << 0, 0, 0);
-    this->n_ba_size = 10;
+    this->n_ba_size = 20;
 }
 
 void VO_estimator::read_stereo_camera_param(Mat rot_l, Mat K_l, Mat dist_l, Mat rot_r, Mat K_r, Mat dist_r)
@@ -467,7 +468,7 @@ void VO_estimator::process()
     // the case new landmarks need to be added 
     if(this->is_keyframe)
     {
-        extract_correspondences(25);
+        extract_correspondences(15);
         if(this->new_matches_on_img_l.size() > 0)
         {
             triangulate_correspondences();
@@ -615,6 +616,10 @@ int main() {
     fs_r["distCoeffs"] >> dist_r;
     fs_r.release();
     my_estimator.read_stereo_camera_param(rot_l, K_l, dist_l, rot_r, K_r, dist_r);
+    // write file
+    ofstream outFile;
+    outFile.open("../est_traj.txt", ios::out);
+    outFile << "# timestamp tx ty tz qx qy qz qw" << endl;
     // loop start
     for(int i = 0; i < timestamps.size(); i++)
     {
@@ -633,5 +638,7 @@ int main() {
         cout << "time:\t" << timeInSeconds << endl;
         // visualization
         visualization(my_estimator, timeInSeconds);
+        outFile << timestamps[i] / 1000000000 << '.' << timestamps[i] % 1000000000 << ' ' << my_estimator.tvec_w.at<double>(0,0) << ' ' << my_estimator.tvec_w.at<double>(0,1) << ' ' << my_estimator.tvec_w.at<double>(0,2) << ' ' << 0 << ' ' << 0 << ' ' << 0 << ' ' << 1 << endl;
     }
+    outFile.close();
 }
