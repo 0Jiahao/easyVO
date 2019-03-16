@@ -10,6 +10,11 @@ This project is mainly built based on [eVO](http://w3.onera.fr/copernic/sites/w3
 ### Data Set
 We evaluate the preformance of this approach with [EuRoC MAV Dataset](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets).
 
+### Result
+<table align="center"><tr><td align="center" width="9999">
+<img src="result.gif" alt="fig1">
+</td></tr></table>
+
 ### Future Work
 - Make it as ROS node
 
